@@ -61,7 +61,7 @@ function getViewMatrix(camera) {
     //         1,
     //     ],
     // ].flat();
-    
+
     const camToWorld = [
         [R[0], R[1], R[2], 0],
         [R[3], R[4], R[5], 0],
@@ -286,7 +286,7 @@ function GS_TO_VERTEX_COMPACT(gs, full_gs=false) {
         rgba[1] = attrs.color[1];
         rgba[2] = attrs.color[2];
         rgba[3] = attrs.opacity;
-        
+
     }
     console.timeEnd("build buffer");
     let end = Date.now();
@@ -299,7 +299,7 @@ function PARSE_RAW_BYTES_COMPACT(arrayLike) {
     const view = new DataView(arrayLike.buffer, arrayLike.byteOffset, arrayLike.byteLength);
     const jsonObjects = [];
     const sizeOfObject = STREAM_ROW_LENGTH; // total bytes for one object
-    
+
     for (let offset = 0; offset < arrayLike.byteLength; offset += sizeOfObject) {
         const start_frame = view.getUint16(offset, false); // true for little-endian
         const end_frame = view.getUint16(offset + 2, false);
@@ -309,7 +309,7 @@ function PARSE_RAW_BYTES_COMPACT(arrayLike) {
             view.getFloat32(offset + 8, false),
             view.getFloat32(offset + 12, false),
         ];
-        
+
         const color = [
             view.getUint8(offset + 16, false),
             view.getUint8(offset + 17, false),
@@ -318,21 +318,21 @@ function PARSE_RAW_BYTES_COMPACT(arrayLike) {
         const opacity = view.getUint8(offset + 19, false);
 
         // we dont really need f_rest
-        
+
         const scaling = [
             view.getFloat32(offset + 20, false),
             view.getFloat32(offset + 24, false),
             view.getFloat32(offset + 28, false),
         ];
-        
+
         const rotation = [
             view.getUint8(offset + 32, false),
             view.getUint8(offset + 33, false),
             view.getUint8(offset + 34, false),
             view.getUint8(offset + 35, false),
         ];
-        
-        
+
+
         jsonObjects.push({
             start_frame,
             end_frame,
@@ -762,6 +762,7 @@ function createWorker(self, SLICE_CAP, SLICE_NUM) {
     };
 }
 
+// language=glsl
 const vertexShaderSource = `
 #version 300 es
 precision highp float;
@@ -823,6 +824,7 @@ void main () {
 }
 `.trim();
 
+// language=glsl
 const fragmentShaderSource = `
 #version 300 es
 precision highp float;
@@ -886,6 +888,7 @@ async function main(config) {
 
     const gl = canvas.getContext("webgl2", {
         antialias: false,
+        xrCompatible: true,
     });
 
     const vertexShader = gl.createShader(gl.VERTEX_SHADER);
@@ -975,6 +978,99 @@ async function main(config) {
 
     window.addEventListener("resize", resize);
     resize();
+
+    let vrPresenting = false;
+    let worldXRTransform = null;
+    let refSpace = null
+
+    //VR - fixme needed to be fully loaded to work
+    // for some reason, the xr don't work before everything is loaded, bc of the while loop?
+    // so init the button only once it is fully loaded
+    function initVRButton() {
+        if (navigator.xr) {
+            navigator.xr.isSessionSupported('immersive-vr').then(supported => {
+                if (supported) {
+                    document.getElementById("enter-vr").disabled = false
+                    document.getElementById("enter-vr").addEventListener('click', () => {
+                        navigator.xr.requestSession('immersive-vr', {optionalFeatures: ['local-floor']}).then(onSessionStarted);
+                    });
+                }
+            });
+        }
+    }
+
+    // initVRButton() //while like to init xr here
+
+
+    async function onSessionStarted(session) {
+        vrPresenting = true;
+        session.addEventListener('end', onSessionEnded);
+        await gl.makeXRCompatible();
+
+        // use config.INIT_VIEW (from the current scene) and apply some transforms to adapt to VR
+        let mat4 = invert4(defaultViewMatrix);
+        mat4 = rotate4(mat4, 180 * Math.PI / 180, 1, 0, 0); //rotate 180° x
+        mat4 = translate4(mat4, 0,0,-2); //get closer to the subject
+        worldXRTransform = invert4(mat4);
+
+        session.updateRenderState({
+            baseLayer: new XRWebGLLayer(session, gl, {
+                framebufferScaleFactor: 0.75
+            })
+        });
+
+        refSpace = await session.requestReferenceSpace('local-floor')
+
+        session.requestAnimationFrame((time, frame) => {
+            const pose = frame.getViewerPose(refSpace);
+            if (pose) {
+                const view = pose.views[0];
+                gl.canvas.width = view.framebufferWidth * downsample;
+                gl.canvas.height = view.framebufferHeight * downsample;
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+            }
+            session.requestAnimationFrame(onXRFrame); // Start regular rendering //.bind(this)
+        });
+    }
+
+    function onXRFrame(time, frame) {
+        let session = frame.session
+        if(vrPresenting)
+            session.requestAnimationFrame(onXRFrame);
+
+        let pose = frame.getViewerPose(refSpace);
+        if (!pose) return;
+
+        let glLayer = session.renderState.baseLayer;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        // let view = pose.views[0] //66
+        for (let view of pose.views) {
+            let viewport = glLayer.getViewport(view);
+            gl.viewport(viewport.x * downsample, viewport.y * downsample, viewport.width * downsample, viewport.height * downsample);
+            let projectionMatrix = view.projectionMatrix;
+            gl.uniform2fv(u_viewport, new Float32Array([viewport.width, viewport.height]));
+            gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
+            gl.uniform2fv(u_focal, new Float32Array([(projectionMatrix[0] * viewport.width) / 2, -(projectionMatrix[5] * viewport.height) / 2]));
+
+            const transformedView = multiply4(view.transform.inverse.matrix, worldXRTransform);
+            gl.uniformMatrix4fv(u_view, false, transformedView);
+            if (vertexCount > 0){
+                gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            }
+
+            const viewProj = multiply4(projectionMatrix, transformedView);
+            worker.postMessage({ view: viewProj });
+        }
+    }
+
+    function onSessionEnded() {
+        vrPresenting = false;
+        resize()
+        frame()
+    }
+
 
     worker.onmessage = (e) => {
         if (e.data.buffer) {
@@ -1466,7 +1562,8 @@ async function main(config) {
             camid.innerText = "";
         }
         lastFrame = now;
-        requestAnimationFrame(frame);
+        if(!vrPresenting)
+            requestAnimationFrame(frame);
     };
     frame();
 
@@ -1510,7 +1607,7 @@ async function main(config) {
     // read frame 0, with sizing MAX_CAP
     while (bytesRead < TOTAL_CAP * STREAM_ROW_LENGTH) {
         let { done, value } = await reader.read();
-        // if there is any reminding fro previous read  
+        // if there is any reminding fro previous read
         let value_offset = 0;
         if (rowBufferOffset > 0){
             if (value.length + rowBufferOffset < STREAM_ROW_LENGTH){
@@ -1643,7 +1740,7 @@ async function main(config) {
     });
     while (bytesRead < SLICE_CAP * STREAM_ROW_LENGTH && loadedFrame < MAX_FRAME) {
         let { done, value } = await reader.read();
-        // if there is any reminding fro previous read  
+        // if there is any reminding fro previous read
         let value_offset = 0;
         if (rowBufferOffset > 0){
             if (value.length + rowBufferOffset < STREAM_ROW_LENGTH){
@@ -1671,7 +1768,7 @@ async function main(config) {
         rowBuffer.set(value_rest);
         rowBufferOffset = value_rest.length;
         bytesRead += num_of_gs * STREAM_ROW_LENGTH;
-        
+
         const PREFETCH_FRAME = FPS * config.PREFETCH_SEC;
         while (bytesRead >= SLICE_CAP * STREAM_ROW_LENGTH){
             loadedFrame++;
@@ -1709,6 +1806,8 @@ async function main(config) {
             break;
         }
     }
+
+    initVRButton()
 
 
 }
@@ -1750,7 +1849,7 @@ function setup_dropdown(target) {
 
 function update_curframe(cur_frame) {
     let curFrameElem = document.getElementById("progress-current");
-    
+
     // Calculate percentage for the current frame
     let curFramePercent = (cur_frame / (MAX_FRAME-1)) * 100;
     curFrameElem.style.width = curFramePercent + "%";
